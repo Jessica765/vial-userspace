@@ -1,4 +1,4 @@
-name: Build firmware
+name: Build Vial Firmware
 
 on: [push, workflow_dispatch]
 
@@ -7,15 +7,16 @@ permissions:
 
 jobs:
   build:
-    name: 'QMK Userspace Build'
+    name: 'QMK Vial Build'
     uses: qmk/.github/.github/workflows/qmk_userspace_build.yml@main
     with:
       qmk_repo: vial-kb/vial-qmk
       qmk_ref: vial
-      preparation_command: "cp -rf keyboards/* qmk_firmware/keyboards/"
+      preparation_command: |
+        cp -rf keyboards/* qmk_firmware/keyboards/
 
   publish:
-    name: 'QMK Userspace Publish'
-    uses: qmk/.github/.github/workflows/qmk_userspace_publish.yml@main
+    name: 'Publish Firmware Artifacts'
     if: always() && !cancelled()
     needs: build
+    uses: qmk/.github/.github/workflows/qmk_userspace_publish.yml@main
