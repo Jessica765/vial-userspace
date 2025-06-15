@@ -1,8 +1,230 @@
 from typing import List, Dict
+import json
 
 KEY_WIDTH = 8  # Width of each key in the ASCII layout
 LAYER_KEYS = {"MO(1)", "MO(2)", "MO(3)"}
 TRANSPARENT_KEYS = {"_______", "TRANSPARENT", "TRNS"}
+
+def convert_from_vial(vial_file_path: str, keyboard_name: str = "custom") -> dict:
+    """Convert Vial JSON keymap to keyboard template format"""
+    with open(vial_file_path, 'r') as f:
+        vial_data = json.load(f)
+
+    layout = vial_data.get("layout", [])
+    encoder_layout = vial_data.get("encoder_layout", [])
+
+    # Detect keyboard type based on layout structure
+    if not layout:
+        return {}
+
+    # Count keys in first layer to determine keyboard type
+    total_keys = sum(len(row) for row in layout[0] if row)
+
+    # Determine if it's split and configuration
+    config = {
+        "is_split": True,  # Most keyboards in your templates are split
+        "split_at": 6,     # Default split point
+        "thumb_count": 6,  # Default thumb count
+        "has_encoders": len(encoder_layout) > 0,
+        "encoder_count": len(encoder_layout[0]) if encoder_layout else 0
+    }
+
+    # Auto-detect based on key count
+    if total_keys >= 58:  # Sofle-like (54 + thumb cluster)
+        config["thumb_count"] = 10
+        config["split_at"] = 6
+    elif total_keys >= 42:  # Corne-like
+        config["thumb_count"] = 6
+        config["split_at"] = 6
+    elif total_keys >= 36:  # Totem-like
+        config["thumb_count"] = 6
+        config["split_at"] = 5
+
+    # Convert layers
+    template = {"config": config}
+
+    layer_names = ["base", "mo1", "mo2", "mo3"]
+
+    for i, layer in enumerate(layout[:4]):  # Process up to 4 layers
+        layer_name = layer_names[i] if i < len(layer_names) else f"layer{i}"        # Separate main rows from thumb cluster
+        # In Vial format for Sofle: rows 0-4 are left half, rows 5-9 are right half
+        # Row structure: [left_row0, left_row1, left_row2, left_row3, left_thumbs, right_row0, right_row1, right_row2, right_row3, right_thumbs]
+        main_rows = []
+        thumbs = []
+
+        if len(layer) == 10:  # Sofle format with separate left/right halves
+            left_main = layer[:4]   # rows 0-3 are left main keys
+            left_thumbs = layer[4]  # row 4 is left thumb keys
+            right_main = layer[5:9] # rows 5-8 are right main keys
+            right_thumbs = layer[9] # row 9 is right thumb keys
+
+            # Combine left and right halves
+            for i in range(4):
+                left_row = left_main[i] if i < len(left_main) else []
+                right_row = right_main[i] if i < len(right_main) else []
+                combined_row = left_row + right_row
+                main_rows.append(combined_row)
+
+            # Combine thumb clusters
+            thumbs = left_thumbs + right_thumbs
+        else:
+            # For other formats: first 4 rows are main, last row is thumbs
+            if len(layer) >= 5:
+                main_rows = layer[:4]
+                thumbs = layer[4] if len(layer) > 4 else []
+            else:
+                main_rows = layer
+
+        # Convert key codes and fix right half inversion
+        converted_rows = []
+        split_at = config["split_at"]
+
+        for row in main_rows:
+            if not row:  # Skip empty rows
+                converted_rows.append([])
+                continue
+
+            converted_row = [convert_keycode(key) for key in row]
+
+            # Fix right half inversion for split keyboards
+            if config["is_split"] and len(converted_row) > split_at:
+                left_half = converted_row[:split_at]
+                right_half = converted_row[split_at:]
+                # Reverse the right half to fix the inversion
+                right_half.reverse()
+                converted_row = left_half + right_half
+
+            converted_rows.append(converted_row)        # Handle thumb cluster - fix the right half inversion
+        converted_thumbs = []
+        if thumbs:
+            converted_thumbs = [convert_keycode(key) for key in thumbs]
+            # For Sofle with 10 thumb keys: [L1, L2, L3, L4, L5, R5, R4, R3, R2, R1]
+            # We want: [L1, L2, L3, L4, L5, R1, R2, R3, R4, R5]
+            if config["is_split"] and len(converted_thumbs) >= 10:
+                # Take only the first 10 keys and fix the inversion
+                converted_thumbs = converted_thumbs[:10]
+                left_thumbs = converted_thumbs[:5]
+                right_thumbs = converted_thumbs[5:]
+                right_thumbs.reverse()
+                converted_thumbs = left_thumbs + right_thumbs
+            elif config["is_split"] and len(converted_thumbs) == 6:
+                left_thumbs = converted_thumbs[:3]
+                right_thumbs = converted_thumbs[3:]
+                right_thumbs.reverse()
+                converted_thumbs = left_thumbs + right_thumbs
+
+        # Handle encoders
+        converted_encoders = []
+        if i < len(encoder_layout) and encoder_layout[i]:
+            for encoder in encoder_layout[i]:
+                if len(encoder) >= 2:
+                    # Convert CCW and CW actions
+                    ccw = convert_keycode(encoder[0])
+                    cw = convert_keycode(encoder[1])
+                    converted_encoders.append([ccw, cw])        # Determine pressed keys for layer
+        pressed_keys = []
+        if i == 0:  # Base layer
+            pressed_keys = []
+        elif i == 1:  # MO(1) layer
+            pressed_keys = ["MO(1)"]
+        elif i == 2:  # MO(2) layer
+            pressed_keys = ["MO(2)"]
+        elif i == 3:  # MO(3) layer (combo)
+            pressed_keys = ["MO(1)", "MO(2)"]
+
+        layer_data = {
+            "rows": converted_rows,
+            "thumbs": converted_thumbs,
+            "pressed": pressed_keys
+        }
+
+        # Add encoders if they exist for this layer
+        if converted_encoders:
+            layer_data["encoders"] = converted_encoders
+
+        template[layer_name] = layer_data
+
+    return {keyboard_name: template}
+
+def convert_keycode(keycode: str) -> str:
+    """Convert QMK/Vial keycode to readable format"""
+    if not keycode or keycode == "KC_NO":
+        return ""
+
+    # Remove KC_ prefix
+    if keycode.startswith("KC_"):
+        keycode = keycode[3:]
+
+    # Handle special cases
+    keycode_map = {
+        "TRNS": "TRNS",
+        "TRANSPARENT": "TRNS",
+        "GRAVE": "`",
+        "BSLASH": "\\",
+        "LCTRL": "Ctrl",
+        "LGUI": "GUI",
+        "MINUS": "-",
+        "EQUAL": "=",
+        "LSHIFT": "Shift",
+        "ESCAPE": "Esc",
+        "LALT": "Alt",
+        "QUOTE": "'",
+        "SCOLON": ";",
+        "ENTER": "Enter",
+        "SLASH": "/",
+        "DOT": ".",
+        "COMMA": ",",
+        "SPACE": "Space",
+        "TAB": "Tab",
+        "BSPACE": "Bksp",
+        "DELETE": "Del",
+        "MUTE": "Mute",
+        "VOLU": "Vol+",
+        "VOLD": "Vol-",
+        "MPRV": "Prev",
+        "MPLY": "Play",
+        "MNXT": "Next",
+        "RESET": "Reset",
+        "PGUP": "PgUp",
+        "PGDN": "PgDn",
+        "PSCR": "PrtSc",
+        "UP": "Up",
+        "DOWN": "Down",
+        "LEFT": "Left",
+        "RIGHT": "Right",
+        "HOME": "Home",
+        "END": "End",
+        "INS": "Insert",
+        "CAPS": "CapsLock",
+        "RBRACKET": "]",
+        "LBRACKET": "[",
+        "PSCREEN": "PrtSc",
+        "INSERT": "Insert",
+        "PGDOWN": "PgDn",
+    }
+
+    # Handle function keys
+    if keycode.startswith("F") and keycode[1:].isdigit():
+        return keycode
+
+    # Handle numbers and letters
+    if keycode.isdigit() or (len(keycode) == 1 and keycode.isalpha()):
+        return keycode
+
+    # Handle MO() layer keys
+    if keycode.startswith("MO(") and keycode.endswith(")"):
+        return keycode
+
+    # Handle hex codes (like "0x7c73")
+    if keycode.startswith("0x"):
+        return keycode
+
+    # Handle macro keys (M1, M2, etc.)
+    if keycode.startswith("M") and keycode[1:].isdigit():
+        return keycode
+
+    # Use mapping or return as-is
+    return keycode_map.get(keycode, keycode)
 
 def format_key(key: str, pressed_keys: List[str] = None) -> str:
     normalized_key = key.strip().upper().replace(" ", "")
@@ -79,7 +301,7 @@ def generate_ascii_layer(
         layout.append(f" *{thumb_border}")
 
     layout.append(" */")
-    return "\n.join(layout)
+    return "\n".join(layout)
 
 def format_half_row(row, width, pressed_keys=None):
     formatted_keys = [format_key(k, pressed_keys) for k in row if k]
@@ -95,7 +317,7 @@ def horizontal_bar(width):
 def pad_half(row_half: list, width: int) -> list:
     return row_half + [""] * (width - len(row_half))
 
-def generate_split_ascii_layer(name, rows, thumbs=None, pressed_keys=None, split_at=6):
+def generate_split_ascii_layer(name, rows, thumbs=None, encoders=None, pressed_keys=None, split_at=6):
     layout = ["/*", f" * {name}"]
     spacer = " " * (KEY_WIDTH * 5)  # Space between keyboard halves
 
@@ -119,9 +341,7 @@ def generate_split_ascii_layer(name, rows, thumbs=None, pressed_keys=None, split
         right_widths[i] = max(0, len(row) - row_split)
 
     left_width = max(left_widths) if left_widths else split_at
-    right_width = max(right_widths) if right_widths else 6
-
-    # Draw keyboard halves with curved borders
+    right_width = max(right_widths) if right_widths else 6    # Draw keyboard halves with curved borders
     top_border_left = "," + "-" * ((KEY_WIDTH + 1) * left_width - 1) + "."
     top_border_right = "," + "-" * ((KEY_WIDTH + 1) * right_width - 1) + "."
     layout.append(f" * {top_border_left}{spacer}{top_border_right}")
@@ -129,12 +349,41 @@ def generate_split_ascii_layer(name, rows, thumbs=None, pressed_keys=None, split
     for i, row in enumerate(rows):
         row_split = split_at
         left = row[:row_split] if len(row) > 0 else []
-        right = row[row_split:] if row_split < len(row) else []
+        right = row[row_split:] if row_split < len(row) else []        # Add encoders to the 4th row (index 3) on the inside edge
+        if i == 3 and encoders:
+            left_encoder = encoders[0] if len(encoders) > 0 else ["", ""]
+            right_encoder = encoders[1] if len(encoders) > 1 else ["", ""]
 
-        layout.append(f" * {format_half_row(left, left_width, pressed_keys)}{spacer}{format_half_row(right, right_width, pressed_keys)}")
+            # Format encoder display as "CCW/CW"
+            left_enc_display = f"{left_encoder[0]}/{left_encoder[1]}" if len(left_encoder) >= 2 else ""
+            right_enc_display = f"{right_encoder[0]}/{right_encoder[1]}" if len(right_encoder) >= 2 else ""
+              # Add encoder to inside edge of each half
+            left_with_encoder = left + [left_enc_display] if left_enc_display else left
+            right_with_encoder = [right_enc_display] + right if right_enc_display else right
+
+            layout.append(f" * {format_half_row(left_with_encoder, left_width + (1 if left_enc_display else 0), pressed_keys)}{spacer}{format_half_row(right_with_encoder, right_width + (1 if right_enc_display else 0), pressed_keys)}")
+        else:
+            layout.append(f" * {format_half_row(left, left_width, pressed_keys)}{spacer}{format_half_row(right, right_width, pressed_keys)}")
 
         if i < len(rows) - 1:
-            layout.append(f" * {horizontal_bar(left_width)}{spacer}{horizontal_bar(right_width)}")
+            # Calculate separator widths to match the next row
+            next_left_width = left_width
+            next_right_width = right_width
+
+            # If the next row (i+1) will have encoders, adjust separator width
+            if (i + 1) == 3 and encoders:
+                left_has_encoder = len(encoders) > 0 and encoders[0] and any(encoders[0])
+                right_has_encoder = len(encoders) > 1 and encoders[1] and any(encoders[1])
+                next_left_width += 1 if left_has_encoder else 0
+                next_right_width += 1 if right_has_encoder else 0
+
+            # Generate separators with proper spacing to avoid wrapping
+            left_separator_parts = ["-" * KEY_WIDTH for _ in range(next_left_width)]
+            right_separator_parts = ["-" * KEY_WIDTH for _ in range(next_right_width)]
+
+            separator_left = "|" + "|".join(left_separator_parts) + "|"
+            separator_right = "|" + "|".join(right_separator_parts) + "|"
+            layout.append(f" * {separator_left}{spacer}{separator_right}")
 
     # Bottom curved border connecting to thumb clusters
     main_layout_width = ((KEY_WIDTH + 1) * left_width)
@@ -185,7 +434,7 @@ def generate_split_ascii_layer(name, rows, thumbs=None, pressed_keys=None, split
         layout.append(f" * {thumb_indent}{left_bottom}{center_gap}{right_bottom}")
 
     layout.append(" */")
-    return "\n.join(layout)
+    return "\n".join(layout)
 
 def generate_totem_ascii_layer(name, rows, thumbs=None, pressed_keys=None):
     """Special formatter for the Totem keyboard with its asymmetric layout"""
@@ -195,7 +444,7 @@ def generate_totem_ascii_layer(name, rows, thumbs=None, pressed_keys=None):
     if not rows and not thumbs:
         layout.append(" * No keys defined for this layer")
         layout.append(" */")
-        return "\n.join(layout)
+        return "\n".join(layout)
 
     # Calculate indent for the shorter rows (1-2)
     indent_chars = (KEY_WIDTH + 1) * 1
@@ -285,7 +534,7 @@ def generate_totem_ascii_layer(name, rows, thumbs=None, pressed_keys=None):
         layout.append(f" * {thumb_indent}{left_bottom}{center_gap}{right_bottom}")
 
     layout.append(" */")
-    return "\n.join(layout)
+    return "\n".join(layout)
 
 def generate_for_keyboard(
     keyboard: str,
@@ -302,15 +551,14 @@ def generate_for_keyboard(
     # Get layers from keyboard data
     layers = keyboard_data.get("layers", {})
     if not layers and "base" in keyboard_data:
-        layers = keyboard_data  # Handle old format
-
-    # Generate layouts for each layer
+        layers = keyboard_data  # Handle old format    # Generate layouts for each layer
     for layer_name, layer_data in layers.items():
         if layer_name == "config":
             continue
 
         rows = layer_data.get("rows", [])
         thumbs = layer_data.get("thumbs", [])
+        encoders = layer_data.get("encoders", [])
         pressed_keys = layer_data.get("pressed", [])
 
         if is_split:
@@ -328,6 +576,7 @@ def generate_for_keyboard(
                     f"{keyboard.upper()} - {layer_name.upper()} Layer",
                     rows,
                     thumbs,
+                    encoders,
                     pressed_keys,
                     split_at=current_split
                 ))
@@ -340,7 +589,7 @@ def generate_for_keyboard(
             ))
         outputs.append("")
 
-    return "\n.join(outputs)
+    return "\n".join(outputs)
 
 # Keyboard templates with layouts defined for different keyboards
 keyboard_templates: Dict[str, Dict[str, List[List[str]]]] = {
@@ -487,6 +736,16 @@ keyboard_templates: Dict[str, Dict[str, List[List[str]]]] = {
 }
 
 if __name__ == "__main__":
-    # Print layouts for each keyboard
-    for keyboard_name in keyboard_templates:
-        print(generate_for_keyboard(keyboard_name, keyboard_templates[keyboard_name]))
+    # Convert a Vial keymap file to a keyboard template
+    vial_file_path = "../keyboards/sofle/rev1/keymaps/base/vial_layout.json"
+    converted_template = convert_from_vial(vial_file_path, "sofle")
+
+    print(f"Converted Sofle keyboard layout from Vial:")
+    print("="*60)
+    for keyboard_name, keyboard_data in converted_template.items():
+        result = generate_for_keyboard(keyboard_name, keyboard_data)
+        print(result)
+
+    # Print layouts for each predefined keyboard template
+    # for keyboard_name in keyboard_templates:
+    #     print(generate_for_keyboard(keyboard_name, keyboard_templates[keyboard_name]))
